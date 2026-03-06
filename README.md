@@ -22,6 +22,9 @@ Cliente de escritorio multiplataforma para gestionar sitios WordPress de forma r
 - **Ajustes del Sitio**: Configurar título, descripción, formato de enlaces permanentes, etc.
 
 ### Editor enriquecido
+
+<img width="1915" height="1046" alt="editor-escoria" src="https://github.com/user-attachments/assets/ddf93737-ed58-46dc-a033-757faf9581bd" />
+
 - Editor **HTML / Visual** con barra de herramientas y vista previa en tiempo real (WebEngine).
 - **Corrector ortográfico** multiidioma (español, inglés) con resaltado de errores y sugerencias.
 - **Contador de palabras** en tiempo real: palabras, caracteres, párrafos, tiempo de lectura estimado y puntuación de legibilidad.
