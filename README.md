@@ -10,6 +10,8 @@ Cliente de escritorio multiplataforma para gestionar sitios WordPress de forma r
 
 ## Características
 
+<img width="1916" height="1035" alt="escoria-interface" src="https://github.com/user-attachments/assets/e674c86d-20fe-4bc0-86b7-5910eecc5095" />
+
 ### Gestión de contenido
 - **Posts**: Crear, editar, publicar, programar y eliminar entradas.
 - **Páginas**: Crear, editar, publicar y eliminar páginas con soporte de jerarquía.
