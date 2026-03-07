@@ -402,6 +402,10 @@ class OfflineStatusWidget(QWidget):
 class OfflineDraftsDialog(QDialog):
     """Diálogo para ver y gestionar borradores offline."""
 
+    # Señal emitida cuando el usuario quiere cargar un borrador en el editor.
+    # Emite el dict completo del borrador (tal como lo devuelve get_draft).
+    load_requested = pyqtSignal(dict)
+
     def __init__(self, offline_manager, parent=None):
         super().__init__(parent)
         self.offline_manager = offline_manager
@@ -429,6 +433,12 @@ class OfflineDraftsDialog(QDialog):
 
         # Botones
         btn_layout = QHBoxLayout()
+
+        self.btn_load = QPushButton("📝 Cargar en Editor")
+        self.btn_load.setObjectName("btnPrimary")
+        self.btn_load.setToolTip("Carga el borrador seleccionado en el editor para continuar editándolo")
+        self.btn_load.clicked.connect(self._load_selected)
+        btn_layout.addWidget(self.btn_load)
 
         self.btn_sync_all = QPushButton("⟳ Sincronizar Todos")
         self.btn_sync_all.setObjectName("btnSuccess")
@@ -466,6 +476,7 @@ class OfflineDraftsDialog(QDialog):
             item = QListWidgetItem("No hay borradores offline pendientes.")
             item.setFlags(Qt.ItemFlag(item.flags() & ~Qt.ItemFlag.ItemIsSelectable))
             self.draft_list.addItem(item)
+            self.btn_load.setEnabled(False)
             self.btn_sync_all.setEnabled(False)
             self.btn_delete_selected.setEnabled(False)
             self.btn_clear_all.setEnabled(False)
@@ -483,6 +494,24 @@ class OfflineDraftsDialog(QDialog):
             self.draft_list.addItem(item)
 
         self.lbl_status.setText(f"{len(drafts)} borrador(es) pendiente(s)")
+
+    def _load_selected(self):
+        """Carga el borrador seleccionado en el editor."""
+        item = self.draft_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "Selecciona un borrador",
+                                   "Selecciona un borrador de la lista para cargarlo en el editor.")
+            return
+        draft_id = item.data(Qt.ItemDataRole.UserRole)
+        if not draft_id:
+            return
+        draft = self.offline_manager.get_draft(draft_id)
+        if not draft:
+            QMessageBox.warning(self, "Error",
+                                "No se pudo leer el archivo del borrador.")
+            return
+        self.load_requested.emit(draft)
+        self.close()
 
     def _sync_all(self):
         """Sincroniza todos los borradores."""

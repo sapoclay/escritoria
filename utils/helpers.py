@@ -91,3 +91,35 @@ def build_excerpt(content, max_length=200):
     """Crea un extracto a partir del contenido."""
     text = strip_html(content)
     return truncate(text, max_length)
+
+
+# ── Validación de datos de imagen ──
+
+# Firmas mágicas de los formatos de imagen más comunes
+_IMAGE_SIGNATURES = (
+    b'\x89PNG',          # PNG
+    b'\xff\xd8\xff',     # JPEG
+    b'GIF87a', b'GIF89a', # GIF
+    b'RIFF',             # WebP (RIFF....WEBP)
+    b'BM',               # BMP
+    b'<svg',             # SVG (texto)
+    b'<?xml',            # SVG con cabecera XML
+)
+
+_MIN_IMAGE_SIZE = 32  # mínimo razonable de bytes para una imagen
+
+
+def is_valid_image_data(data: bytes) -> bool:
+    """Comprueba si los bytes parecen datos de imagen válidos.
+
+    Verifica la longitud mínima y que los primeros bytes coincidan
+    con alguna firma de formato conocido.  Esto evita que páginas
+    HTML de error o descargas truncadas se pasen al decodificador
+    de Qt, lo que produce mensajes como «libpng error: Read Error».
+    """
+    if not data or len(data) < _MIN_IMAGE_SIZE:
+        return False
+    for sig in _IMAGE_SIGNATURES:
+        if data[:len(sig)] == sig:
+            return True
+    return False

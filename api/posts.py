@@ -41,7 +41,8 @@ class PostsAPI:
                categories=None, tags=None, featured_media=0,
                comment_status="open", ping_status="open",
                format_type="standard", sticky=False, slug="",
-               date=None, password="", author=None, template=""):
+               date=None, password="", author=None, template="",
+               meta=None):
         """Crea un nuevo post."""
         data = {
             "title": title,
@@ -68,6 +69,8 @@ class PostsAPI:
             data["author"] = author
         if template:
             data["template"] = template
+        if meta:
+            data["meta"] = meta
 
         return self.client.post("posts", data=data)
 

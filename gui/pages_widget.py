@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QScrollArea
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QPixmap
 
 from gui.editor_widget import ContentEditor
 from utils.worker import WorkerThread
@@ -49,12 +49,15 @@ class PagesWidget(QWidget):
         self.api = api_client
         self.offline_manager = offline_manager
         from api.pages import PagesAPI
+        from api.media import MediaAPI
         self.pages_api = PagesAPI(api_client)
+        self.media_api = MediaAPI(api_client)
         self.current_page_num = 1
         self.total_pages = 1
         self.current_page_data = None
         self.all_pages = []  # Para el selector de padre
         self._threads = []
+        self._loaded_offline_draft_id = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -176,7 +179,7 @@ class PagesWidget(QWidget):
         slug_layout.addWidget(self.txt_slug)
         left_layout.addLayout(slug_layout)
 
-        self.editor = ContentEditor()
+        self.editor = ContentEditor(media_api=self.media_api)
         left_layout.addWidget(self.editor, stretch=1)
 
         excerpt_group = QGroupBox("Extracto")
@@ -544,6 +547,12 @@ class PagesWidget(QWidget):
 
     def _on_page_saved(self, result):
         self.current_page_data = result
+
+        # Eliminar borrador offline si se cargó desde uno
+        if self._loaded_offline_draft_id and self.offline_manager:
+            self.offline_manager.delete_draft(self._loaded_offline_draft_id)
+            self._loaded_offline_draft_id = None
+
         QMessageBox.information(self, "Éxito", "Página guardada correctamente.")
         self.status_label.setText("Página guardada")
 
@@ -593,14 +602,47 @@ class PagesWidget(QWidget):
         self.load_pages()
 
     def _set_featured_image(self):
-        mid, ok = QInputDialog.getInt(self, "Imagen Destacada", "ID del medio:", 0, 0)
-        if ok and mid > 0:
-            self.featured_media_id = mid
-            self.lbl_featured.setText(f"ID: {mid}")
+        """Abre el selector visual de la biblioteca de medios."""
+        from gui.media_picker import MediaPickerDialog
+        dialog = MediaPickerDialog(self.media_api, parent=self)
+        if dialog.exec_() == MediaPickerDialog.Accepted:
+            media_id = dialog.get_selected_media_id()
+            if media_id > 0:
+                self.featured_media_id = media_id
+                self.lbl_featured.setText(f"Seleccionada (ID: {media_id})")
+                self._load_featured_thumbnail(media_id)
 
     def _remove_featured_image(self):
         self.featured_media_id = 0
+        self.lbl_featured.setPixmap(QPixmap())
         self.lbl_featured.setText("Sin imagen destacada")
+
+    def _load_featured_thumbnail(self, media_id):
+        """Carga la miniatura de la imagen destacada en un hilo."""
+        from gui.posts_widget import _FeaturedImageThread
+        t = _FeaturedImageThread(self.media_api, media_id)
+        t.finished.connect(self._on_featured_thumbnail_loaded)
+        t.error.connect(self._on_featured_thumbnail_error)
+        self._threads.append(t)
+        t.start()
+
+    def _on_featured_thumbnail_loaded(self, image_data, media_id):
+        """Callback cuando la miniatura se descarg\u00f3."""
+        pixmap = QPixmap()
+        pixmap.loadFromData(image_data)
+        if not pixmap.isNull():
+            scaled_pixmap = pixmap.scaled(
+                200, 150, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.lbl_featured.setPixmap(scaled_pixmap)
+            self.lbl_featured.setToolTip(f"ID: {media_id}")
+        else:
+            self.lbl_featured.setText(f"ID: {media_id} (sin vista previa)")
+
+    def _on_featured_thumbnail_error(self, error):
+        """Callback si falla la carga de la miniatura."""
+        self.lbl_featured.setText(f"ID: {self.featured_media_id} (error: {error})")
 
     # --- Métodos SEO (Yoast) ---
 
@@ -690,3 +732,50 @@ class PagesWidget(QWidget):
         super().showEvent(a0)
         if self.stack.currentIndex() == 0:
             self.load_pages()
+
+    def load_from_draft(self, draft):
+        """Carga un borrador offline en el editor para continuar editándolo.
+
+        Args:
+            draft: dict con la estructura del borrador offline
+                   {"id", "type", "post_id", "data": {...}, ...}
+        """
+        data = draft.get("data", {})
+        page_id = draft.get("post_id")
+
+        if page_id:
+            self.current_page_data = {"id": page_id}
+            self.edit_title_label.setText("Editar Página (borrador offline)")
+            self.btn_delete.setVisible(True)
+        else:
+            self.current_page_data = None
+            self.edit_title_label.setText("Nueva Página (borrador offline)")
+            self.btn_delete.setVisible(False)
+
+        self.txt_title.setText(data.get("title", ""))
+        self.txt_slug.setText(data.get("slug", ""))
+
+        content = data.get("content", "")
+        self.editor.set_raw_html(content)
+
+        self.txt_excerpt.setPlainText(data.get("excerpt", ""))
+
+        status_map = {"draft": 0, "pending": 1, "publish": 2, "private": 3}
+        self.combo_status.setCurrentIndex(
+            status_map.get(data.get("status", "draft"), 0)
+        )
+
+        self.date_edit.setDateTime(QDateTime.currentDateTime())
+        self.txt_password.setText(data.get("password", ""))
+        self.chk_comments.setChecked(
+            data.get("comment_status", "open") == "open"
+        )
+        self.featured_media_id = data.get("featured_media", 0)
+        self.lbl_featured.setText("Sin imagen destacada")
+        self.spin_order.setValue(data.get("menu_order", 0))
+
+        self._load_parent_pages()
+        self.stack.setCurrentIndex(1)
+
+        self._loaded_offline_draft_id = draft.get("id")
+        self.status_label.setText("Borrador offline cargado en el editor")

@@ -7,7 +7,8 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPlainTextEdit,
     QPushButton, QTabWidget, QToolBar, QAction, QFontComboBox,
     QSpinBox, QColorDialog, QFileDialog, QLabel, QComboBox,
-    QInputDialog, QMessageBox, QMenu
+    QInputDialog, QMessageBox, QMenu, QDialog, QGroupBox,
+    QFormLayout, QRadioButton, QButtonGroup, QLineEdit as _QLineEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QUrl as _QUrl, QThread
 from PyQt5.QtGui import (
@@ -21,9 +22,55 @@ from utils.spell_checker import (
     SpellCheckHighlighter, SpellCheckMixin, HAS_SPELLCHECKER,
     get_available_languages, LANGUAGE_NAMES
 )
+import re as _re
 import requests as _requests
 import urllib3 as _urllib3
 _urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
+
+try:
+    import markdown as _markdown
+    _HAS_MARKDOWN = True
+except ImportError:
+    _HAS_MARKDOWN = False
+
+
+# ── Patrones comunes de Markdown ──────────────────────────────────────
+_MD_PATTERNS = [
+    _re.compile(r'^#{1,6}\s+', _re.MULTILINE),           # encabezados
+    _re.compile(r'^\*{3,}$|^-{3,}$|^_{3,}$', _re.MULTILINE),  # hr
+    _re.compile(r'^\s*[-*+]\s+', _re.MULTILINE),         # listas desordenadas
+    _re.compile(r'^\s*\d+\.\s+', _re.MULTILINE),         # listas ordenadas
+    _re.compile(r'\[.+?\]\(.+?\)'),                       # enlaces [t](u)
+    _re.compile(r'!\[.*?\]\(.+?\)'),                      # imágenes ![](u)
+    _re.compile(r'(\*{1,2}|_{1,2}).+?\1'),                # negrita/cursiva
+    _re.compile(r'`[^`]+`'),                              # código inline
+    _re.compile(r'^```', _re.MULTILINE),                  # bloques de código
+    _re.compile(r'^>\s+', _re.MULTILINE),                 # citas
+]
+
+
+def _looks_like_markdown(text: str) -> bool:
+    """Heurística: devuelve True si el texto parece Markdown.
+
+    Se exige al menos 2 patrones distintos O un patrón muy específico
+    (encabezado, enlace, imagen o bloque de código) para reducir falsos
+    positivos con texto plano que contenga guiones o asteriscos.
+    """
+    if not text or len(text) < 4:
+        return False
+    # Si ya contiene etiquetas HTML significativas, no es Markdown
+    if _re.search(r'<(?:p|div|h[1-6]|ul|ol|table|blockquote)[ >/]', text, _re.I):
+        return False
+    hits = 0
+    strong_patterns = {0, 3, 4, 5, 8, 9}  # encabezados, ol, enlaces, imgs, ```, citas
+    for idx, pattern in enumerate(_MD_PATTERNS):
+        if pattern.search(text):
+            hits += 1
+            if idx in strong_patterns:
+                return True          # un solo patrón "fuerte" basta
+            if hits >= 2:
+                return True
+    return False
 
 
 def _make_download_session() -> _requests.Session:
@@ -58,10 +105,11 @@ class _ImageDownloadThread(QThread):
         self._url = url
 
     def run(self):
+        from utils.helpers import is_valid_image_data
         try:
             session = _make_download_session()
             resp = session.get(self._url, timeout=20)
-            if resp.status_code == 200 and resp.content:
+            if resp.status_code == 200 and is_valid_image_data(resp.content):
                 self.finished.emit(self._url, resp.content)
             else:
                 self.error.emit(self._url)
@@ -70,13 +118,45 @@ class _ImageDownloadThread(QThread):
 
 
 class SpellCheckTextEdit(SpellCheckMixin, QTextEdit):
-    """QTextEdit con corrección ortográfica e imágenes remotas (asíncronas)."""
+    """QTextEdit con corrección ortográfica, pegado de Markdown e imágenes remotas."""
+
+    # Señal emitida cuando se pega Markdown convertido a HTML
+    markdown_pasted = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image_cache: dict[str, QImage] = {}
         self._pending_urls: set[str] = set()
         self._download_threads: list[_ImageDownloadThread] = []
+
+    # ── Pegado inteligente de Markdown ──────────────────────────────
+
+    def insertFromMimeData(self, source) -> None:  # type: ignore[override]
+        """Intercepta el pegado: si el texto parece Markdown lo convierte a HTML."""
+        if source is None:
+            return super().insertFromMimeData(source)
+
+        # Solo actuar cuando el portapapeles trae texto plano (sin HTML)
+        has_html = source.hasHtml() and '<' in (source.html() or '')
+        plain = source.text() or ''
+
+        if not has_html and plain and _HAS_MARKDOWN and _looks_like_markdown(plain):
+            # Convertir Markdown → HTML con extensiones útiles
+            html = _markdown.markdown(
+                plain,
+                extensions=['tables', 'fenced_code', 'codehilite',
+                            'toc', 'nl2br', 'sane_lists'],
+                output_format='html5',
+            )
+            # Insertar el HTML resultante en el editor visual
+            cursor = self.textCursor()
+            cursor.insertHtml(html)
+            # Notificar para que el editor HTML se sincronice
+            self.markdown_pasted.emit(html)
+            return
+
+        # Comportamiento por defecto (texto/html normal)
+        super().insertFromMimeData(source)
 
     def loadResource(self, resource_type: int, url) -> object:  # type: ignore[override]
         """Devuelve imágenes remotas desde caché o lanza descarga asíncrona."""
@@ -163,13 +243,300 @@ class SpellCheckTextEdit(SpellCheckMixin, QTextEdit):
         self.blockSignals(False)
 
 
+class MarkdownAwarePlainTextEdit(QPlainTextEdit):
+    """QPlainTextEdit que convierte Markdown pegado a HTML automáticamente."""
+
+    def insertFromMimeData(self, source) -> None:  # type: ignore[override]
+        """Si el texto pegado parece Markdown, lo convierte a HTML."""
+        if source is None:
+            return super().insertFromMimeData(source)
+
+        plain = source.text() or ''
+        if plain and _HAS_MARKDOWN and _looks_like_markdown(plain):
+            html = _markdown.markdown(
+                plain,
+                extensions=['tables', 'fenced_code', 'codehilite',
+                            'toc', 'nl2br', 'sane_lists'],
+                output_format='html5',
+            )
+            cursor = self.textCursor()
+            cursor.insertText(html)
+            return
+
+        super().insertFromMimeData(source)
+
+
+# ── Diálogo de inserción de imagen ──────────────────────────────
+
+class _UploadImageThread(QThread):
+    """Sube una imagen local a la biblioteca de medios de WordPress."""
+    finished = pyqtSignal(dict)   # resultado del API
+    error = pyqtSignal(str)
+
+    def __init__(self, media_api, file_path, title="", alt_text="",
+                 caption="", description="", parent=None):
+        super().__init__(parent)
+        self.media_api = media_api
+        self.file_path = file_path
+        self.title = title
+        self.alt_text = alt_text
+        self.caption = caption
+        self.description = description
+
+    def run(self):
+        try:
+            result = self.media_api.upload(
+                self.file_path,
+                title=self.title or None,
+                alt_text=self.alt_text,
+                caption=self.caption,
+                description=self.description,
+            )
+            media_id = result.get("id", 0)
+            if media_id and self.alt_text:
+                try:
+                    self.media_api.update(media_id, alt_text=self.alt_text)
+                except Exception:
+                    pass
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class _InsertImageDialog(QDialog):
+    """Diálogo para insertar una imagen desde URL, archivo local o biblioteca."""
+
+    def __init__(self, media_api=None, parent=None):
+        super().__init__(parent)
+        self.media_api = media_api
+        self._result_url = ""
+        self._result_alt = ""
+        self._upload_thread = None
+        self.setWindowTitle("Insertar imagen")
+        self.setMinimumWidth(520)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # ── Modo de origen ──
+        self._radio_url = QRadioButton("Desde URL")
+        self._radio_local = QRadioButton("Subir archivo local")
+        self._radio_library = QRadioButton("Biblioteca de medios")
+        self._radio_url.setChecked(True)
+
+        self._radio_group = QButtonGroup(self)
+        self._radio_group.addButton(self._radio_url, 0)
+        self._radio_group.addButton(self._radio_local, 1)
+        self._radio_group.addButton(self._radio_library, 2)
+        self._radio_group.idToggled.connect(self._on_mode_changed)
+
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(self._radio_url)
+        mode_layout.addWidget(self._radio_local)
+        if self.media_api:
+            mode_layout.addWidget(self._radio_library)
+        else:
+            # Sin API, desactivar opciones que la requieren
+            self._radio_local.setEnabled(False)
+            self._radio_local.setToolTip("Requiere conexión al servidor")
+        layout.addLayout(mode_layout)
+
+        # ── Panel URL ──
+        self._url_group = QGroupBox("URL de la imagen")
+        url_form = QFormLayout(self._url_group)
+        self._txt_url = _QLineEdit()
+        self._txt_url.setPlaceholderText("https://ejemplo.com/imagen.jpg")
+        url_form.addRow("URL:", self._txt_url)
+        layout.addWidget(self._url_group)
+
+        # ── Panel archivo local ──
+        self._local_group = QGroupBox("Archivo local")
+        local_layout = QVBoxLayout(self._local_group)
+        file_row = QHBoxLayout()
+        self._txt_file = _QLineEdit()
+        self._txt_file.setReadOnly(True)
+        self._txt_file.setPlaceholderText("Selecciona un archivo…")
+        file_row.addWidget(self._txt_file)
+        btn_browse = QPushButton("Examinar…")
+        btn_browse.clicked.connect(self._browse_file)
+        file_row.addWidget(btn_browse)
+        local_layout.addLayout(file_row)
+
+        seo_form = QFormLayout()
+        seo_form.setSpacing(4)
+        self._txt_local_title = _QLineEdit()
+        self._txt_local_title.setPlaceholderText("Título descriptivo")
+        seo_form.addRow("Título:", self._txt_local_title)
+        self._txt_local_caption = _QLineEdit()
+        self._txt_local_caption.setPlaceholderText("Leyenda (opcional)")
+        seo_form.addRow("Leyenda:", self._txt_local_caption)
+        self._txt_local_desc = _QLineEdit()
+        self._txt_local_desc.setPlaceholderText("Descripción larga (opcional)")
+        seo_form.addRow("Descripción:", self._txt_local_desc)
+        local_layout.addLayout(seo_form)
+
+        self._local_group.setVisible(False)
+        layout.addWidget(self._local_group)
+
+        # ── Texto ALT (común) ──
+        alt_group = QGroupBox("Texto alternativo (SEO)")
+        alt_form = QFormLayout(alt_group)
+        self._txt_alt = _QLineEdit()
+        self._txt_alt.setPlaceholderText("Describe la imagen para buscadores y accesibilidad")
+        self._txt_alt.setToolTip(
+            "Atributo ALT: campo clave para SEO y lectores de pantalla."
+        )
+        alt_form.addRow("Texto ALT:", self._txt_alt)
+        alt_hint = QLabel("⚡ Campo clave para SEO y accesibilidad")
+        alt_hint.setStyleSheet("color: #f0ad4e; font-size: 11px;")
+        alt_form.addRow("", alt_hint)
+        layout.addWidget(alt_group)
+
+        # ── Estado ──
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: #aaa; font-size: 12px;")
+        layout.addWidget(self._status)
+
+        # ── Botones ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._btn_ok = QPushButton("Insertar")
+        self._btn_ok.setStyleSheet(
+            "QPushButton { background-color: #0073aa; color: white; "
+            "padding: 6px 20px; border-radius: 3px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #005f8c; }"
+            "QPushButton:disabled { background-color: #444; color: #888; }"
+        )
+        self._btn_ok.clicked.connect(self._on_accept)
+        btn_row.addWidget(self._btn_ok)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+    # ── Cambio de modo ──
+
+    def _on_mode_changed(self, button_id: int, checked: bool):
+        if not checked:
+            return
+        self._url_group.setVisible(button_id == 0)
+        self._local_group.setVisible(button_id == 1)
+
+    # ── Examinar archivo ──
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar imagen", "",
+            "Imágenes (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.svg);;Todos (*)"
+        )
+        if path:
+            import os
+            self._txt_file.setText(path)
+            basename = os.path.splitext(os.path.basename(path))[0]
+            default_title = basename.replace("-", " ").replace("_", " ")
+            if not self._txt_local_title.text().strip():
+                self._txt_local_title.setText(default_title)
+
+    # ── Aceptar ──
+
+    def _on_accept(self):
+        mode = self._radio_group.checkedId()
+        self._result_alt = self._txt_alt.text().strip()
+
+        if mode == 0:
+            # URL directa
+            url = self._txt_url.text().strip()
+            if not url:
+                QMessageBox.warning(self, "Error", "Introduce una URL de imagen.")
+                return
+            self._result_url = url
+            self.accept()
+
+        elif mode == 1:
+            # Subir archivo local
+            file_path = self._txt_file.text().strip()
+            if not file_path:
+                QMessageBox.warning(self, "Error", "Selecciona un archivo.")
+                return
+            if not self.media_api:
+                QMessageBox.warning(self, "Error", "No hay conexión al servidor.")
+                return
+            self._btn_ok.setEnabled(False)
+            self._status.setText("Subiendo imagen al servidor…")
+            self._upload_thread = _UploadImageThread(
+                self.media_api, file_path,
+                title=self._txt_local_title.text().strip(),
+                alt_text=self._result_alt,
+                caption=self._txt_local_caption.text().strip(),
+                description=self._txt_local_desc.text().strip(),
+                parent=self,
+            )
+            self._upload_thread.finished.connect(self._on_upload_done)
+            self._upload_thread.error.connect(self._on_upload_error)
+            self._upload_thread.start()
+
+        elif mode == 2:
+            # Biblioteca de medios
+            from gui.media_picker import MediaPickerDialog
+            picker = MediaPickerDialog(self.media_api, parent=self)
+            if picker.exec_() == QDialog.Accepted:
+                media_id = picker.get_selected_media_id()
+                if media_id:
+                    # Obtener la URL del medio seleccionado
+                    self._btn_ok.setEnabled(False)
+                    self._status.setText("Obteniendo URL de la imagen…")
+                    from utils.worker import WorkerThread
+                    self._media_thread = WorkerThread(
+                        lambda: self.media_api.get(media_id), parent=self
+                    )
+                    self._media_thread.finished.connect(self._on_media_fetched)
+                    self._media_thread.error.connect(self._on_upload_error)
+                    self._media_thread.start()
+
+    def _on_upload_done(self, result: dict):
+        self._btn_ok.setEnabled(True)
+        self._status.setText("")
+        source_url = result.get("source_url", "")
+        if source_url:
+            self._result_url = source_url
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Error", "La imagen se subió pero no se obtuvo URL.")
+
+    def _on_media_fetched(self, media: dict):
+        self._btn_ok.setEnabled(True)
+        self._status.setText("")
+        source_url = media.get("source_url", "")
+        if source_url:
+            self._result_url = source_url
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Error", "No se pudo obtener la URL de la imagen.")
+
+    def _on_upload_error(self, error: str):
+        self._btn_ok.setEnabled(True)
+        self._status.setText("")
+        QMessageBox.critical(self, "Error al subir", error)
+
+    # ── Getters ──
+
+    def get_image_url(self) -> str:
+        return self._result_url
+
+    def get_alt_text(self) -> str:
+        return self._result_alt
+
+
 class ContentEditor(QWidget):
     """Editor de contenido con soporte para HTML visual y código fuente."""
 
     content_changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, media_api=None, parent=None):
         super().__init__(parent)
+        self.media_api = media_api
         self._setup_ui()
         self._is_updating = False
         self._update_timer = QTimer(self)
@@ -222,6 +589,7 @@ class ContentEditor(QWidget):
         self.visual_editor.setAcceptRichText(True)
         self.visual_editor.setMinimumHeight(scaled(250, sf))
         self.visual_editor.textChanged.connect(self._on_visual_changed)
+        self.visual_editor.markdown_pasted.connect(self._on_markdown_pasted)
 
         # Inicializar corrector ortográfico
         if HAS_SPELLCHECKER:
@@ -232,8 +600,8 @@ class ContentEditor(QWidget):
 
         self.tabs.addTab(self.visual_editor, "Visual")
 
-        # Tab HTML
-        self.html_editor = QPlainTextEdit()
+        # Tab HTML (con conversión automática de Markdown al pegar)
+        self.html_editor = MarkdownAwarePlainTextEdit()
         self.html_editor.setMinimumHeight(scaled(250, sf))
         font = QFont("Consolas, Monaco, monospace", 12)
         self.html_editor.setFont(font)
@@ -511,15 +879,14 @@ class ContentEditor(QWidget):
                 cursor.insertHtml(f'<a href="{url}">{text}</a>')
 
     def _insert_image(self):
-        url, ok = QInputDialog.getText(self, "Insertar Imagen", "URL de la imagen:")
-        if ok and url:
-            alt, ok2 = QInputDialog.getText(
-                self, "Texto Alternativo",
-                "Texto alt:"
-            )
-            if ok2:
+        """Abre un diálogo para insertar imagen desde URL, archivo local o biblioteca."""
+        dlg = _InsertImageDialog(media_api=self.media_api, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            url = dlg.get_image_url()
+            alt = dlg.get_alt_text()
+            if url:
                 cursor = self.visual_editor.textCursor()
-                cursor.insertHtml(f'<img src="{url}"alt="{alt}" />')
+                cursor.insertHtml(f'<img src="{url}" alt="{alt}" />')
 
     def _set_alignment(self, alignment):
         cursor = self.visual_editor.textCursor()
@@ -558,6 +925,25 @@ class ContentEditor(QWidget):
         cursor.insertHtml('<hr />')
 
     # ---- Sincronización de tabs ----
+
+    def _on_markdown_pasted(self, html: str):
+        """Se llama cuando se pega Markdown convertido a HTML.
+
+        Sincroniza el contenido del editor HTML para que get_content()
+        devuelva el HTML limpio resultante de la conversión.
+        """
+        self._is_updating = True
+        try:
+            current = self.html_editor.toPlainText()
+            # Añadir el HTML convertido al editor de código
+            if current:
+                self.html_editor.setPlainText(current + "\n" + html)
+            else:
+                self.html_editor.setPlainText(html)
+        finally:
+            self._is_updating = False
+        self.content_changed.emit()
+        self._update_timer.start()
 
     def _on_visual_changed(self):
         if not self._is_updating:

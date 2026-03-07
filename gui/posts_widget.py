@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QFormLayout, QGroupBox, QCheckBox, QDateTimeEdit,
     QHeaderView, QAbstractItemView, QDialog, QDialogButtonBox,
     QTextEdit, QSpinBox, QListWidget, QListWidgetItem, QStackedWidget,
-    QInputDialog, QScrollArea
+    QInputDialog, QScrollArea, QTreeWidget, QTreeWidgetItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime
 from PyQt5.QtGui import QFont, QColor, QPixmap
@@ -17,7 +17,7 @@ from gui.editor_widget import ContentEditor
 from utils.worker import WorkerThread
 from utils.helpers import (
     format_date, strip_html, truncate, get_status_display,
-    get_status_color, extract_rendered
+    get_status_color, extract_rendered, is_valid_image_data
 )
 from api.yoast_seo import extract_yoast_data, build_yoast_meta, has_yoast_seo
 from utils.screen_utils import get_scale_factor, scaled
@@ -111,7 +111,7 @@ class _FeaturedImageThread(QThread):
             session.mount("https://", adapter)
             session.mount("http://", adapter)
             resp = session.get(url, timeout=20)
-            if resp.status_code == 200 and resp.content:
+            if resp.status_code == 200 and is_valid_image_data(resp.content):
                 self.finished.emit(resp.content, self.media_id)
             else:
                 self.error.emit(f"HTTP {resp.status_code}")
@@ -142,6 +142,7 @@ class PostsWidget(QWidget):
         self._tag_map: dict[int, str] = {}
         self._cat_map: dict[int, str] = {}
         self._threads = []
+        self._loaded_offline_draft_id = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -302,7 +303,7 @@ class PostsWidget(QWidget):
         left_layout.addLayout(slug_layout)
 
         # Editor de contenido
-        self.editor = ContentEditor()
+        self.editor = ContentEditor(media_api=self.media_api)
         left_layout.addWidget(self.editor, stretch=1)
 
         # Extracto
@@ -392,12 +393,17 @@ class PostsWidget(QWidget):
         format_layout.addWidget(self.combo_format)
         right_layout.addWidget(format_group)
 
-        # Categorías
+        # Categorías (árbol jerárquico)
         cat_group = QGroupBox("Categorías")
         cat_layout = QVBoxLayout(cat_group)
-        self.cat_list = QListWidget()
-        self.cat_list.setMaximumHeight(150)
-        cat_layout.addWidget(self.cat_list)
+        self.cat_tree = QTreeWidget()
+        self.cat_tree.setHeaderHidden(True)
+        self.cat_tree.setMinimumHeight(250)
+        self.cat_tree.setStyleSheet(
+            "QTreeWidget { background-color: #2b2b2b; border: 1px solid #444; }"
+            "QTreeWidget::item { padding: 2px 0; }"
+        )
+        cat_layout.addWidget(self.cat_tree)
         right_layout.addWidget(cat_group)
 
         # Etiquetas
@@ -765,8 +771,9 @@ class PostsWidget(QWidget):
 
     def _load_categories(self, selected_ids=None):
         """Carga las categorías disponibles en hilo secundario."""
-        self.cat_list.clear()
-        self.cat_list.addItem(QListWidgetItem("Cargando categorías..."))
+        self.cat_tree.clear()
+        placeholder = QTreeWidgetItem(self.cat_tree, ["Cargando categorías..."])
+        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
         self._pending_cat_ids = selected_ids
         t = WorkerThread(lambda: self.categories_api.get_all())
         t.finished.connect(self._on_categories_loaded)
@@ -775,24 +782,50 @@ class PostsWidget(QWidget):
         t.start()
 
     def _on_categories_loaded(self, cats):
-        """Rellena la lista de categorías con los datos recibidos."""
-        self.cat_list.clear()
+        """Rellena el árbol de categorías jerárquicamente."""
+        self.cat_tree.clear()
         self.categories = cats
-        selected_ids = self._pending_cat_ids
+        selected_ids = self._pending_cat_ids or []
+
+        # Construir mapa id -> categoría y agrupar por parent
+        cat_map: dict[int, dict] = {}
+        children_map: dict[int, list] = {}  # parent_id -> [cat, ...]
         for cat in cats:
-            name = extract_rendered(cat.get("name", ""))
-            item = QListWidgetItem(strip_html(name))
-            item.setData(Qt.ItemDataRole.UserRole, cat["id"])
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            if selected_ids and cat["id"] in selected_ids:
-                item.setCheckState(Qt.CheckState.Checked)
-            else:
-                item.setCheckState(Qt.CheckState.Unchecked)
-            self.cat_list.addItem(item)
+            cid = cat.get("id", 0)
+            parent = cat.get("parent", 0)
+            cat_map[cid] = cat
+            children_map.setdefault(parent, []).append(cat)
+
+        # Ordenar hijos alfabéticamente por nombre
+        for kids in children_map.values():
+            kids.sort(key=lambda c: strip_html(extract_rendered(c.get("name", ""))).lower())
+
+        # Crear ítems del árbol, devolviendo el QTreeWidgetItem creado
+        def _add_children(parent_widget, parent_id: int):
+            for cat in children_map.get(parent_id, []):
+                cid = cat["id"]
+                name = strip_html(extract_rendered(cat.get("name", "")))
+                tree_item = QTreeWidgetItem(parent_widget, [name])
+                tree_item.setData(0, Qt.ItemDataRole.UserRole, cid)
+                tree_item.setFlags(
+                    tree_item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsAutoTristate
+                )
+                if cid in selected_ids:
+                    tree_item.setCheckState(0, Qt.CheckState.Checked)
+                else:
+                    tree_item.setCheckState(0, Qt.CheckState.Unchecked)
+                # Recursión para hijos
+                _add_children(tree_item, cid)
+
+        _add_children(self.cat_tree, 0)
+        self.cat_tree.expandAll()
 
     def _on_categories_error(self, error):
-        self.cat_list.clear()
-        self.cat_list.addItem(QListWidgetItem(f"Error: {error}"))
+        self.cat_tree.clear()
+        err_item = QTreeWidgetItem(self.cat_tree, [f"Error: {error}"])
+        err_item.setFlags(Qt.ItemFlag.NoItemFlags)
 
     def _save_post(self, status=None):
         """Guarda el post actual."""
@@ -813,12 +846,20 @@ class PostsWidget(QWidget):
         }
         post_format = format_map.get(self.combo_format.currentIndex(), "standard")
 
-        # Obtener categorías seleccionadas
+        # Obtener categorías seleccionadas (recorrido recursivo del árbol)
         selected_cats = []
-        for i in range(self.cat_list.count()):
-            item = self.cat_list.item(i)
-            if item is not None and item.checkState() == Qt.CheckState.Checked:
-                selected_cats.append(item.data(Qt.ItemDataRole.UserRole))
+
+        def _collect_checked(parent_item):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    cid = child.data(0, Qt.ItemDataRole.UserRole)
+                    if cid is not None:
+                        selected_cats.append(cid)
+                _collect_checked(child)
+
+        root = self.cat_tree.invisibleRootItem()
+        _collect_checked(root)
 
         data = {
             "title": title,
@@ -882,6 +923,12 @@ class PostsWidget(QWidget):
         title = extract_rendered(result.get("title", ""))
         status = get_status_display(result.get("status", ""))
         self.current_post = result
+
+        # Eliminar borrador offline si se cargó desde uno
+        if self._loaded_offline_draft_id and self.offline_manager:
+            self.offline_manager.delete_draft(self._loaded_offline_draft_id)
+            self._loaded_offline_draft_id = None
+
         QMessageBox.information(
             self, "Éxito",
             f"Entrada guardada correctamente.\n"
@@ -1021,15 +1068,15 @@ class PostsWidget(QWidget):
         self.lbl_featured.setText(f"ID: {self.featured_media_id} (error: {error})")
 
     def _set_featured_image(self):
-        """Establece la imagen destacada."""
-        media_id, ok = QInputDialog.getInt(
-            self, "Imagen Destacada",
-            "Introduce el ID del medio (imagen):", value=0, min=0
-        )
-        if ok and media_id > 0:
-            self.featured_media_id = media_id
-            self.lbl_featured.setText("Cargando miniatura...")
-            self._load_featured_thumbnail(media_id)
+        """Abre el selector visual de la biblioteca de medios."""
+        from gui.media_picker import MediaPickerDialog
+        dialog = MediaPickerDialog(self.media_api, parent=self)
+        if dialog.exec_() == MediaPickerDialog.Accepted:
+            media_id = dialog.get_selected_media_id()
+            if media_id > 0:
+                self.featured_media_id = media_id
+                self.lbl_featured.setText("Cargando miniatura...")
+                self._load_featured_thumbnail(media_id)
 
     def _remove_featured_image(self):
         """Quita la imagen destacada."""
@@ -1128,3 +1175,66 @@ class PostsWidget(QWidget):
         super().showEvent(a0)
         if self.stack.currentIndex() == 0:
             self.load_posts()
+
+    def load_from_draft(self, draft):
+        """Carga un borrador offline en el editor para continuar editándolo.
+
+        Args:
+            draft: dict con la estructura del borrador offline
+                   {"id", "type", "post_id", "data": {...}, ...}
+        """
+        data = draft.get("data", {})
+        post_id = draft.get("post_id")
+
+        # Si es una edición de un post existente, guardamos la referencia mínima
+        if post_id:
+            self.current_post = {"id": post_id}
+            self.edit_title_label.setText("Editar Entrada (borrador offline)")
+            self.btn_delete_post.setVisible(True)
+        else:
+            self.current_post = None
+            self.edit_title_label.setText("Nueva Entrada (borrador offline)")
+            self.btn_delete_post.setVisible(False)
+
+        self.txt_title.setText(data.get("title", ""))
+        self.txt_slug.setText(data.get("slug", ""))
+
+        content = data.get("content", "")
+        self.editor.set_raw_html(content)
+
+        self.txt_excerpt.setPlainText(data.get("excerpt", ""))
+
+        # Estado
+        status_map = {"draft": 0, "pending": 1, "publish": 2, "private": 3}
+        self.combo_status.setCurrentIndex(
+            status_map.get(data.get("status", "draft"), 0)
+        )
+
+        # Formato
+        format_map = {
+            "standard": 0, "quote": 1, "status": 2, "chat": 3,
+            "gallery": 4, "link": 5, "image": 6, "video": 7, "audio": 8
+        }
+        self.combo_format.setCurrentIndex(
+            format_map.get(data.get("format_type", "standard"), 0)
+        )
+
+        self.date_edit.setDateTime(QDateTime.currentDateTime())
+        self.chk_sticky.setChecked(data.get("sticky", False))
+        self.txt_password.setText(data.get("password", ""))
+        self.chk_comments.setChecked(
+            data.get("comment_status", "open") == "open"
+        )
+        self.chk_pings.setChecked(
+            data.get("ping_status", "open") == "open"
+        )
+        self.featured_media_id = data.get("featured_media", 0)
+        self.lbl_featured.setText("Sin imagen destacada")
+        self.txt_tags.clear()
+
+        self._load_categories(data.get("categories", []))
+        self.stack.setCurrentIndex(1)
+
+        # Guardar referencia al borrador offline para poder eliminarlo tras publicar
+        self._loaded_offline_draft_id = draft.get("id")
+        self.status_label.setText("Borrador offline cargado en el editor")

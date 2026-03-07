@@ -37,7 +37,8 @@ class PagesAPI:
     def create(self, title, content="", status="draft", excerpt="",
                parent=0, menu_order=0, featured_media=0,
                comment_status="closed", template="",
-               slug="", date=None, password="", author=None):
+               slug="", date=None, password="", author=None,
+               meta=None):
         """Crea una nueva página."""
         data = {
             "title": title,
@@ -59,6 +60,8 @@ class PagesAPI:
             data["password"] = password
         if author:
             data["author"] = author
+        if meta:
+            data["meta"] = meta
 
         return self.client.post("pages", data=data)
 

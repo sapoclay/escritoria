@@ -87,13 +87,16 @@ class WordPressClient:
         """Realiza una petición POST."""
         url = self._build_url(endpoint)
         if files:
-            # Para subida de archivos, no usar JSON
-            headers = {k: v for k, v in self.session.headers.items()
-                       if k != "Content-Type"}
-            response = self.session.post(
-                url, data=data, files=files,
-                headers=headers, timeout=self.timeout
-            )
+            # Para subida de archivos, eliminar Content-Type de la sesión
+            # para que requests genere el multipart/form-data con boundary.
+            content_type = self.session.headers.pop("Content-Type", None)
+            try:
+                response = self.session.post(
+                    url, data=data, files=files, timeout=self.timeout
+                )
+            finally:
+                if content_type:
+                    self.session.headers["Content-Type"] = content_type
         else:
             response = self.session.post(url, json=data, timeout=self.timeout)
         return self._handle_response(response)

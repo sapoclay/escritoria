@@ -602,9 +602,44 @@ class MainWindow(QMainWindow):
     def _show_offline_drafts(self):
         """Muestra el diálogo de borradores offline."""
         dlg = OfflineDraftsDialog(self.offline_manager, self)
+        dlg.load_requested.connect(self._load_offline_draft_into_editor)
         if dlg.exec_():
             # Si se pidió sincronizar
             self._sync_offline_drafts()
+
+    def _load_offline_draft_into_editor(self, draft):
+        """Carga un borrador offline en el widget editor correspondiente.
+
+        Args:
+            draft: dict con la estructura completa del borrador offline.
+        """
+        content_type = draft.get("type", "post")
+
+        if content_type == "post":
+            if not self.posts_widget:
+                QMessageBox.warning(
+                    self, "Sin Conexión",
+                    "Conéctate primero a un sitio WordPress para abrir el editor de entradas."
+                )
+                return
+            self._navigate(1)  # Entradas
+            self.posts_widget.load_from_draft(draft)
+            self._status_message("Borrador offline cargado en el editor de entradas")
+        elif content_type == "page":
+            if not self.pages_widget:
+                QMessageBox.warning(
+                    self, "Sin Conexión",
+                    "Conéctate primero a un sitio WordPress para abrir el editor de páginas."
+                )
+                return
+            self._navigate(2)  # Páginas
+            self.pages_widget.load_from_draft(draft)
+            self._status_message("Borrador offline cargado en el editor de páginas")
+        else:
+            QMessageBox.warning(
+                self, "Tipo desconocido",
+                f"No se reconoce el tipo de contenido: {content_type}"
+            )
 
     def _sync_offline_drafts(self):
         """Sincroniza todos los borradores offline."""

@@ -11,9 +11,10 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap
-from utils.helpers import format_date, strip_html, extract_rendered
+from utils.helpers import format_date, strip_html, extract_rendered, is_valid_image_data
 from utils.worker import WorkerThread
 from utils.screen_utils import get_scale_factor, scaled, get_dialog_size
+from gui.media_picker import MediaUploadDialog
 import os
 import requests
 from io import BytesIO
@@ -43,6 +44,13 @@ class UploadThread(QThread):
                 alt_text=self.alt_text,
                 description=self.description
             )
+            # Asegurar que alt_text se guarda (algunos WP lo ignoran en upload)
+            media_id = result.get("id", 0)
+            if media_id and self.alt_text:
+                try:
+                    self.media_api.update(media_id, alt_text=self.alt_text)
+                except Exception:
+                    pass  # no crítico
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -64,7 +72,7 @@ class ImageLoaderThread(QThread):
                 self.url, timeout=20, headers=headers,
                 verify=True, allow_redirects=True
             )
-            if resp.status_code == 200 and resp.content:
+            if resp.status_code == 200 and is_valid_image_data(resp.content):
                 self.finished.emit(resp.content)
             else:
                 self.error.emit(f"HTTP {resp.status_code}")
@@ -75,7 +83,7 @@ class ImageLoaderThread(QThread):
                     self.url, timeout=20, headers=headers,
                     verify=False, allow_redirects=True
                 )
-                if resp.status_code == 200 and resp.content:
+                if resp.status_code == 200 and is_valid_image_data(resp.content):
                     self.finished.emit(resp.content)
                 else:
                     self.error.emit(f"HTTP {resp.status_code} (sin SSL)")
@@ -434,6 +442,11 @@ class MediaWidget(QWidget):
         if not file_path:
             return
 
+        # Mostrar diálogo de metadatos SEO antes de subir
+        seo_dlg = MediaUploadDialog(file_path, parent=self)
+        if seo_dlg.exec_() != QDialog.Accepted:
+            return
+
         filename = os.path.basename(file_path)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
@@ -441,8 +454,10 @@ class MediaWidget(QWidget):
 
         thread = UploadThread(
             self.media_api, file_path,
-            title=os.path.splitext(filename)[0],
-            caption="", alt_text="", description=""
+            title=seo_dlg.get_title(),
+            caption=seo_dlg.get_caption(),
+            alt_text=seo_dlg.get_alt_text(),
+            description=seo_dlg.get_description(),
         )
         thread.finished.connect(self._on_upload_finished)
         thread.error.connect(self._on_upload_error)
