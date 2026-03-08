@@ -478,9 +478,11 @@ class PagesWidget(QWidget):
         self.txt_password.setText(page.get("password", ""))
         self.chk_comments.setChecked(page.get("comment_status") == "open")
         self.featured_media_id = page.get("featured_media", 0)
-        self.lbl_featured.setText(
-            f"ID: {self.featured_media_id}"if self.featured_media_id else "Sin imagen"
-        )
+        if self.featured_media_id:
+            self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id}) — cargando miniatura...")
+            self._load_featured_thumbnail(self.featured_media_id)
+        else:
+            self.lbl_featured.setText("Sin imagen destacada")
         self.spin_order.setValue(page.get("menu_order", 0))
         self._load_parent_pages(page.get("parent", 0), page.get("id"))
 
@@ -566,7 +568,14 @@ class PagesWidget(QWidget):
         # Limpiar autoguardado local tras éxito
         clear_autosave("page")
 
-        QMessageBox.information(self, "Éxito", "Página guardada correctamente.")
+        title = strip_html(extract_rendered(result.get("title", "")))
+        status = get_status_display(result.get("status", ""))
+        QMessageBox.information(
+            self, "Éxito",
+            f"Página guardada correctamente.\n"
+            f"Título: {title}\n"
+            f"Estado: {status}"
+        )
         self.status_label.setText("Página guardada")
 
     def _on_page_save_error(self, error):
@@ -809,9 +818,9 @@ class PagesWidget(QWidget):
             self.load_from_draft(draft_compat)
             clear_autosave("page")
             return True
-        else:
-            clear_autosave("page")
-            return False
+        # Si el usuario declina, NO borramos el autoguardado para que
+        # pueda recuperarlo después desde Archivo > Borradores Offline.
+        return False
 
     def showEvent(self, a0):
         super().showEvent(a0)
@@ -872,8 +881,11 @@ class PagesWidget(QWidget):
         # Imagen destacada
         self.featured_media_id = data.get("featured_media", 0)
         if self.featured_media_id:
-            self.lbl_featured.setText("Cargando miniatura...")
-            self._load_featured_thumbnail(self.featured_media_id)
+            self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id}) — cargando miniatura...")
+            try:
+                self._load_featured_thumbnail(self.featured_media_id)
+            except Exception:
+                self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id})")
         else:
             self.lbl_featured.setText("Sin imagen destacada")
             self.lbl_featured.setPixmap(QPixmap())

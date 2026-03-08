@@ -8,9 +8,9 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QStackedWidget, QStatusBar, QMessageBox, QAction, QMenu,
     QMenuBar, QFrame, QScrollArea, QApplication, QSplitter,
-    QSystemTrayIcon, QDialog, QDialogButtonBox
+    QSystemTrayIcon, QDialog, QDialogButtonBox, QProgressBar
 )
-from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QUrl
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QUrl, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QDesktopServices
 
 from api.client import WordPressClient
@@ -34,6 +34,100 @@ from utils.offline_manager import (
     OfflineManager, OfflineStatusWidget, OfflineDraftsDialog, SyncThread,
     has_any_autosave
 )
+
+
+class LoadingSplash(QDialog):
+    """Splash de carga con barra de progreso durante la conexión."""
+
+    def __init__(self, logo_path, parent=None):
+        super().__init__(parent, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+        self._setup_ui(logo_path)
+        self.resize(380, 320)
+        if parent:
+            self._center_on_parent(parent)
+
+    def _center_on_parent(self, parent):
+        geo = parent.geometry()
+        x = geo.x() + (geo.width() - self.width()) // 2
+        y = geo.y() + (geo.height() - self.height()) // 2
+        self.move(x, y)
+
+    def _setup_ui(self, logo_path):
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Contenedor con fondo
+        container = QFrame()
+        container.setStyleSheet(
+            "QFrame { background-color: #1e1e2e; border-radius: 16px;"
+            " border: 1px solid #45475a; }"
+        )
+        c_layout = QVBoxLayout(container)
+        c_layout.setContentsMargins(30, 30, 30, 30)
+        c_layout.setSpacing(15)
+        c_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Logo
+        if os.path.exists(logo_path):
+            lbl_logo = QLabel()
+            pixmap = QPixmap(logo_path).scaled(
+                140, 140,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            lbl_logo.setPixmap(pixmap)
+            lbl_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_logo.setStyleSheet("background: transparent; border: none;")
+            c_layout.addWidget(lbl_logo)
+
+        # Mensaje
+        self.lbl_message = QLabel("Conectando...")
+        self.lbl_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_message.setStyleSheet(
+            "color: #cdd6f4; font-size: 14px; font-weight: bold;"
+            " background: transparent; border: none;"
+        )
+        c_layout.addWidget(self.lbl_message)
+
+        # Barra de progreso
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        self.progress.setStyleSheet(
+            "QProgressBar { background-color: #313244; border-radius: 4px;"
+            " border: none; }"
+            "QProgressBar::chunk { background-color: #89b4fa; border-radius: 4px; }"
+        )
+        c_layout.addWidget(self.progress)
+
+        # Sub-mensaje
+        self.lbl_detail = QLabel("")
+        self.lbl_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_detail.setStyleSheet(
+            "color: #a6adc8; font-size: 11px;"
+            " background: transparent; border: none;"
+        )
+        c_layout.addWidget(self.lbl_detail)
+
+        layout.addWidget(container)
+
+    def set_progress(self, value, message="", detail=""):
+        """Actualiza la barra de progreso y los mensajes."""
+        self.progress.setValue(value)
+        if message:
+            self.lbl_message.setText(message)
+        if detail:
+            self.lbl_detail.setText(detail)
+        QApplication.processEvents()
+
+    def finish(self):
+        """Completa la barra y cierra el splash."""
+        self.set_progress(100, "¡Listo!", "")
+        QTimer.singleShot(400, self.close)
 
 
 class ConnectionCheckThread(QThread):
@@ -421,6 +515,11 @@ class MainWindow(QMainWindow):
         self.lbl_connection_status.setText("Conectando...")
         self._status_message("Conectando al servidor...")
 
+        # Mostrar splash de carga
+        self._splash = LoadingSplash(self._logo_path, self)
+        self._splash.set_progress(10, "Conectando...", connection["url"])
+        self._splash.show()
+
         self._check_thread = ConnectionCheckThread(self.client)
         self._check_thread.result.connect(
             lambda result: self._on_connected(result, connection)
@@ -454,19 +553,37 @@ class MainWindow(QMainWindow):
                 f"Zona horaria: {result.get('timezone_string', 'N/A')}"
             )
 
+            # Actualizar splash
+            if hasattr(self, '_splash') and self._splash:
+                self._splash.set_progress(30, "Conexión establecida",
+                                          f"Bienvenido, {username}")
+
             # Crear widgets de gestión
             self._create_widgets()
+
+            if hasattr(self, '_splash') and self._splash:
+                self._splash.set_progress(50, "Preparando el escritorio...",
+                                          "Cargando módulos")
 
             # Iniciar monitoreo offline
             self.offline_manager.set_api_client(self.client)
             self.offline_status.refresh()
 
-            # Cargar conteos del dashboard
+            if hasattr(self, '_splash') and self._splash:
+                self._splash.set_progress(60, "Cargando datos...",
+                                          "Obteniendo información del sitio")
+
+            # Cargar conteos del dashboard (con seguimiento del splash)
             self._load_dashboard_counts()
 
             # Comprobar borradores autoguardados y offline pendientes
             self._check_pending_drafts()
         else:
+            # Cerrar splash en caso de error
+            if hasattr(self, '_splash') and self._splash:
+                self._splash.close()
+                self._splash = None
+
             error = result.get("error", "Error desconocido")
             self.lbl_connection_status.setText("Error de conexión")
             self._status_message(f"Error: {error}")
@@ -535,31 +652,64 @@ class MainWindow(QMainWindow):
             users_api = UsersAPI(self.client)
 
             self._dashboard_threads = []
+            self._dashboard_done_count = 0
 
-            def _make_count_handler(card, label_name):
+            labels = ["Entradas", "Páginas", "Comentarios", "Usuarios"]
+            total_tasks = 4
+
+            def _make_count_handler(card, label_name, task_label):
                 def handler(result):
                     if isinstance(result, dict):
                         count = result.get("total", 0)
                         label = card.findChild(QLabel, label_name)
                         if label:
                             label.setText(str(count))
+                    self._dashboard_done_count += 1
+                    progress = 60 + int(40 * self._dashboard_done_count / total_tasks)
+                    if hasattr(self, '_splash') and self._splash:
+                        if self._dashboard_done_count < total_tasks:
+                            self._splash.set_progress(
+                                progress, "Cargando datos...",
+                                f"{task_label} ✓"
+                            )
+                        else:
+                            self._splash.finish()
+                            self._splash = None
                 return handler
 
             configs = [
-                (lambda: posts_api.list(per_page=1, status="publish"), self.card_posts),
-                (lambda: pages_api.list(per_page=1, status="publish"), self.card_pages),
-                (lambda: comments_api.list(per_page=1, status="hold"), self.card_comments),
-                (lambda: users_api.list(per_page=1), self.card_users),
+                (lambda: posts_api.list(per_page=1, status="publish"), self.card_posts, labels[0]),
+                (lambda: pages_api.list(per_page=1, status="publish"), self.card_pages, labels[1]),
+                (lambda: comments_api.list(per_page=1, status="hold"), self.card_comments, labels[2]),
+                (lambda: users_api.list(per_page=1), self.card_users, labels[3]),
             ]
 
-            for fn, card in configs:
+            for fn, card, task_label in configs:
                 t = WorkerThread(fn)
-                t.finished.connect(_make_count_handler(card, "cardValue"))
+                t.finished.connect(_make_count_handler(card, "cardValue", task_label))
+                t.error.connect(lambda _e, tl=task_label: self._on_dashboard_count_error(tl))
                 self._dashboard_threads.append(t)
                 t.start()
 
         except Exception:
-            pass
+            if hasattr(self, '_splash') and self._splash:
+                self._splash.finish()
+                self._splash = None
+
+    def _on_dashboard_count_error(self, task_label):
+        """Maneja errores en la carga de conteos del dashboard."""
+        self._dashboard_done_count += 1
+        total_tasks = 4
+        progress = 60 + int(40 * self._dashboard_done_count / total_tasks)
+        if hasattr(self, '_splash') and self._splash:
+            if self._dashboard_done_count < total_tasks:
+                self._splash.set_progress(
+                    progress, "Cargando datos...",
+                    f"{task_label} (error)"
+                )
+            else:
+                self._splash.finish()
+                self._splash = None
 
     def _disconnect(self):
         """Desconecta del servidor."""

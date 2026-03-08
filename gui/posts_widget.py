@@ -757,7 +757,7 @@ class PostsWidget(QWidget):
 
         self.featured_media_id = post.get("featured_media", 0)
         if self.featured_media_id:
-            self.lbl_featured.setText("Cargando miniatura...")
+            self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id}) — cargando miniatura...")
             self._load_featured_thumbnail(self.featured_media_id)
         else:
             self.lbl_featured.setText("Sin imagen destacada")
@@ -1283,9 +1283,9 @@ class PostsWidget(QWidget):
             self.load_from_draft(draft_compat)
             clear_autosave("post")
             return True
-        else:
-            clear_autosave("post")
-            return False
+        # Si el usuario declina, NO borramos el autoguardado para que
+        # pueda recuperarlo después desde Archivo > Borradores Offline.
+        return False
 
     def showEvent(self, a0):
         """Se ejecuta al mostrar el widget."""
@@ -1362,8 +1362,11 @@ class PostsWidget(QWidget):
         # Imagen destacada
         self.featured_media_id = data.get("featured_media", 0)
         if self.featured_media_id:
-            self.lbl_featured.setText("Cargando miniatura...")
-            self._load_featured_thumbnail(self.featured_media_id)
+            self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id}) — cargando miniatura...")
+            try:
+                self._load_featured_thumbnail(self.featured_media_id)
+            except Exception:
+                self.lbl_featured.setText(f"Imagen destacada (ID: {self.featured_media_id})")
         else:
             self.lbl_featured.setText("Sin imagen destacada")
             self.lbl_featured.setPixmap(QPixmap())

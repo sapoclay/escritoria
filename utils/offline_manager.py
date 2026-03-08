@@ -398,7 +398,7 @@ class OfflineStatusWidget(QWidget):
         layout.addWidget(self.lbl_pending)
 
         # Botón sincronizar
-        self.btn_sync = QPushButton("⟳ Sincronizar")
+        self.btn_sync = QPushButton("Sincronizar")
         self.btn_sync.setFixedHeight(22)
         self.btn_sync.setStyleSheet("""
             QPushButton {
@@ -498,13 +498,13 @@ class OfflineDraftsDialog(QDialog):
         # Botones
         btn_layout = QHBoxLayout()
 
-        self.btn_load = QPushButton("📝 Cargar en Editor")
+        self.btn_load = QPushButton("Cargar en Editor")
         self.btn_load.setObjectName("btnPrimary")
         self.btn_load.setToolTip("Carga el borrador seleccionado en el editor para continuar editándolo")
         self.btn_load.clicked.connect(self._load_selected)
         btn_layout.addWidget(self.btn_load)
 
-        self.btn_sync_all = QPushButton("⟳ Sincronizar Todos")
+        self.btn_sync_all = QPushButton("Sincronizar Todos")
         self.btn_sync_all.setObjectName("btnSuccess")
         self.btn_sync_all.clicked.connect(self._sync_all)
         btn_layout.addWidget(self.btn_sync_all)
@@ -545,7 +545,7 @@ class OfflineDraftsDialog(QDialog):
             action = "Edición" if autosave.get("post_id") else "Nueva"
             saved_at = autosave.get("saved_at", "")[:19].replace("T", " ")
 
-            text = f"💾 [Autoguardado • {dtype}] {action}: {title}  —  {saved_at}"
+            text = f"[Autoguardado - {dtype}] {action}: {title}  --  {saved_at}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, f"__autosave__{ctype}")
             item.setForeground(QColor("#f0c674"))  # amarillo para distinguir
@@ -560,7 +560,7 @@ class OfflineDraftsDialog(QDialog):
             action = "Editar" if draft.get("post_id") else "Crear"
             created = draft.get("created_at", "")[:19].replace("T", " ")
 
-            text = f"☁ [Offline • {dtype}] {action}: {title}  —  {created}"
+            text = f"[Offline - {dtype}] {action}: {title}  --  {created}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, draft["id"])
             self.draft_list.addItem(item)
@@ -599,8 +599,19 @@ class OfflineDraftsDialog(QDialog):
             ctype = draft_id.replace("__autosave__", "")
             autosave = get_autosave(ctype)
             if not autosave:
-                QMessageBox.warning(self, "Error",
-                                    "No se pudo leer el autoguardado.")
+                autosave_file = AUTOSAVE_DIR / f"{ctype}_autosave.json"
+                if not autosave_file.exists():
+                    QMessageBox.warning(
+                        self, "Autoguardado no encontrado",
+                        "El archivo de autoguardado ya no existe.\n"
+                        "Es posible que haya sido recuperado o eliminado."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self, "Error de lectura",
+                        f"No se pudo leer el autoguardado:\n{autosave_file}"
+                    )
+                self._load_drafts()  # refrescar la lista
                 return
             # Construir dict compatible con load_from_draft
             draft_compat = {
@@ -609,7 +620,8 @@ class OfflineDraftsDialog(QDialog):
                 "data": autosave.get("data", {}),
             }
             self.load_requested.emit(draft_compat)  # type: ignore[attr-defined]
-            clear_autosave(ctype)
+            # No borramos el autoguardado aquí: el editor lo limpia
+            # automáticamente al guardar o al volver a la lista.
             self.close()
             return
 
