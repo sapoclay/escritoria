@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget, QTextEdit, QInputDialog, QListWidget, QListWidgetItem,
     QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime, QTimer
 from PyQt5.QtGui import QColor, QPixmap
 
 from gui.editor_widget import ContentEditor
@@ -21,7 +21,7 @@ from utils.helpers import (
 )
 from api.yoast_seo import extract_yoast_data, build_yoast_meta, has_yoast_seo
 from utils.screen_utils import get_scale_factor, scaled
-from utils.offline_manager import OfflineManager
+from utils.offline_manager import OfflineManager, save_autosave, get_autosave, clear_autosave
 
 
 class LoadPagesThread(QThread):
@@ -59,6 +59,14 @@ class PagesWidget(QWidget):
         self._threads = []
         self._loaded_offline_draft_id = None
         self._setup_ui()
+
+        # Auto-guardado local periódico
+        from config.settings import load_config
+        _cfg = load_config()
+        interval_secs = _cfg.get("auto_save_interval", 60)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._do_autosave)
+        self._autosave_interval = max(interval_secs, 10) * 1000
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -433,6 +441,7 @@ class PagesWidget(QWidget):
         self._load_parent_pages()
         self.btn_delete.setVisible(False)
         self.stack.setCurrentIndex(1)
+        self._autosave_timer.start(self._autosave_interval)
 
     def _edit_selected_page(self):
         row = self.table.currentRow()
@@ -480,6 +489,7 @@ class PagesWidget(QWidget):
 
         self.btn_delete.setVisible(True)
         self.stack.setCurrentIndex(1)
+        self._autosave_timer.start(self._autosave_interval)
 
     def _load_parent_pages(self, selected_parent=0, exclude_id=None):
         self.combo_parent.clear()
@@ -553,6 +563,9 @@ class PagesWidget(QWidget):
             self.offline_manager.delete_draft(self._loaded_offline_draft_id)
             self._loaded_offline_draft_id = None
 
+        # Limpiar autoguardado local tras éxito
+        clear_autosave("page")
+
         QMessageBox.information(self, "Éxito", "Página guardada correctamente.")
         self.status_label.setText("Página guardada")
 
@@ -598,6 +611,8 @@ class PagesWidget(QWidget):
         QMessageBox.critical(self, "Error", str(error))
 
     def _back_to_list(self):
+        self._autosave_timer.stop()
+        clear_autosave("page")
         self.stack.setCurrentIndex(0)
         self.load_pages()
 
@@ -703,30 +718,100 @@ class PagesWidget(QWidget):
         return data
 
     def _save_offline_draft(self):
-        """Guarda el contenido actual como borrador offline."""
+        """Guarda el contenido actual como borrador offline (todos los campos)."""
         if not self.offline_manager:
             return
 
-        title = self.txt_title.text().strip()
-        if not title:
-            title = "Sin título"
-
-        data = {
-            "title": title,
-            "content": self.editor.get_content(),
-            "status": "draft",
-            "excerpt": self.txt_excerpt.toPlainText(),
-            "slug": self.txt_slug.text().strip(),
-        }
-
+        data = self._gather_editor_data()
         page_id = self.current_page_data.get("id") if self.current_page_data else None
         draft_id = self.offline_manager.save_draft("page", data, page_id)
+        title = data.get("title", "Sin título")
         self.status_label.setText(f"Borrador offline guardado: {draft_id}")
         QMessageBox.information(
             self, "Borrador Offline",
             f"La página «{title}» se ha guardado localmente.\n"
             "Se sincronizará automáticamente cuando se restablezca la conexión."
         )
+
+    def _gather_editor_data(self):
+        """Recopila TODOS los campos del editor en un dict serializable."""
+        title = self.txt_title.text().strip() or "Sin título"
+        status_map = {0: "draft", 1: "pending", 2: "publish", 3: "private"}
+        status = status_map.get(self.combo_status.currentIndex(), "draft")
+
+        parent_idx = self.combo_parent.currentIndex()
+        parent = self.combo_parent.itemData(parent_idx) or 0
+
+        dt = self.date_edit.dateTime()
+        date_str = dt.toString(Qt.DateFormat.ISODate)
+
+        seo_data = self._get_seo_data()
+
+        data = {
+            "title": title,
+            "content": self.editor.get_content(),
+            "status": status,
+            "excerpt": self.txt_excerpt.toPlainText(),
+            "slug": self.txt_slug.text().strip(),
+            "parent": parent,
+            "menu_order": self.spin_order.value(),
+            "featured_media": self.featured_media_id,
+            "comment_status": "open" if self.chk_comments.isChecked() else "closed",
+            "password": self.txt_password.text(),
+            "date": date_str,
+        }
+        if seo_data:
+            data["seo"] = seo_data
+        return data
+
+    def _do_autosave(self):
+        """Callback del timer: guarda el estado del editor localmente."""
+        if self.stack.currentIndex() != 1:
+            return
+        title = self.txt_title.text().strip()
+        content = self.editor.get_content()
+        if not title and not content:
+            return
+        try:
+            data = self._gather_editor_data()
+            page_id = self.current_page_data.get("id") if self.current_page_data else None
+            save_autosave("page", data, page_id)
+        except Exception:
+            pass
+
+    def check_and_recover_autosave(self):
+        """Comprueba si hay un autoguardado pendiente y ofrece recuperarlo."""
+        autosave = get_autosave("page")
+        if not autosave:
+            return False
+
+        data = autosave.get("data", {})
+        title = data.get("title", "Sin título")
+        saved_at = autosave.get("saved_at", "")[:19].replace("T", " ")
+        page_id = autosave.get("post_id")
+        action = "edición" if page_id else "nueva página"
+
+        reply = QMessageBox.question(
+            self, "Recuperar borrador",
+            f"Se encontró un borrador autoguardado de página:\n\n"
+            f"  Título: {title}\n"
+            f"  Tipo: {action}\n"
+            f"  Guardado: {saved_at}\n\n"
+            "¿Deseas recuperarlo para seguir editándolo?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            draft_compat = {
+                "type": "page",
+                "post_id": page_id,
+                "data": data,
+            }
+            self.load_from_draft(draft_compat)
+            clear_autosave("page")
+            return True
+        else:
+            clear_autosave("page")
+            return False
 
     def showEvent(self, a0):
         super().showEvent(a0)
@@ -745,11 +830,11 @@ class PagesWidget(QWidget):
 
         if page_id:
             self.current_page_data = {"id": page_id}
-            self.edit_title_label.setText("Editar Página (borrador offline)")
+            self.edit_title_label.setText("Editar Página (borrador recuperado)")
             self.btn_delete.setVisible(True)
         else:
             self.current_page_data = None
-            self.edit_title_label.setText("Nueva Página (borrador offline)")
+            self.edit_title_label.setText("Nueva Página (borrador recuperado)")
             self.btn_delete.setVisible(False)
 
         self.txt_title.setText(data.get("title", ""))
@@ -765,17 +850,56 @@ class PagesWidget(QWidget):
             status_map.get(data.get("status", "draft"), 0)
         )
 
-        self.date_edit.setDateTime(QDateTime.currentDateTime())
+        # Fecha
+        date_str = data.get("date", "")
+        if date_str:
+            try:
+                from dateutil import parser as dp
+                dt = dp.parse(date_str)
+                self.date_edit.setDateTime(QDateTime(
+                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+                ))
+            except Exception:
+                self.date_edit.setDateTime(QDateTime.currentDateTime())
+        else:
+            self.date_edit.setDateTime(QDateTime.currentDateTime())
+
         self.txt_password.setText(data.get("password", ""))
         self.chk_comments.setChecked(
             data.get("comment_status", "open") == "open"
         )
+
+        # Imagen destacada
         self.featured_media_id = data.get("featured_media", 0)
-        self.lbl_featured.setText("Sin imagen destacada")
+        if self.featured_media_id:
+            self.lbl_featured.setText("Cargando miniatura...")
+            self._load_featured_thumbnail(self.featured_media_id)
+        else:
+            self.lbl_featured.setText("Sin imagen destacada")
+            self.lbl_featured.setPixmap(QPixmap())
+
         self.spin_order.setValue(data.get("menu_order", 0))
 
-        self._load_parent_pages()
+        # SEO: restaurar si hay datos guardados
+        seo_data = data.get("seo", {})
+        if seo_data:
+            self.txt_seo_title.setText(seo_data.get("seo_title", ""))
+            self.txt_seo_description.setPlainText(seo_data.get("meta_description", ""))
+            self.txt_seo_keyword.setText(seo_data.get("focus_keyword", ""))
+            self.txt_seo_canonical.setText(seo_data.get("canonical_url", ""))
+            self.txt_seo_og_title.setText(seo_data.get("og_title", ""))
+            self.txt_seo_og_desc.setText(seo_data.get("og_description", ""))
+            self.txt_seo_og_image.setText(seo_data.get("og_image", ""))
+            self.chk_seo_noindex.setChecked(bool(seo_data.get("meta_robots_noindex", False)))
+            self.chk_seo_nofollow.setChecked(bool(seo_data.get("meta_robots_nofollow", False)))
+        else:
+            self._clear_seo_fields()
+
+        self._load_parent_pages(data.get("parent", 0), page_id)
         self.stack.setCurrentIndex(1)
 
+        # Iniciar autoguardado
+        self._autosave_timer.start(self._autosave_interval)
+
         self._loaded_offline_draft_id = draft.get("id")
-        self.status_label.setText("Borrador offline cargado en el editor")
+        self.status_label.setText("Borrador recuperado y cargado en el editor")

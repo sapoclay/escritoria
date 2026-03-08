@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QSpinBox, QListWidget, QListWidgetItem, QStackedWidget,
     QInputDialog, QScrollArea, QTreeWidget, QTreeWidgetItem
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDateTime, QTimer
 from PyQt5.QtGui import QFont, QColor, QPixmap
 
 from gui.editor_widget import ContentEditor
@@ -21,7 +21,7 @@ from utils.helpers import (
 )
 from api.yoast_seo import extract_yoast_data, build_yoast_meta, has_yoast_seo
 from utils.screen_utils import get_scale_factor, scaled
-from utils.offline_manager import OfflineManager
+from utils.offline_manager import OfflineManager, save_autosave, get_autosave, clear_autosave
 
 
 class LoadPostsThread(QThread):
@@ -144,6 +144,14 @@ class PostsWidget(QWidget):
         self._threads = []
         self._loaded_offline_draft_id = None
         self._setup_ui()
+
+        # Auto-guardado local periódico (cada 60 s por defecto)
+        from config.settings import load_config
+        _cfg = load_config()
+        interval_secs = _cfg.get("auto_save_interval", 60)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._do_autosave)
+        self._autosave_interval = max(interval_secs, 10) * 1000  # mínimo 10 s
 
     def _setup_ui(self):
         """Configura la interfaz."""
@@ -682,6 +690,7 @@ class PostsWidget(QWidget):
         self.btn_delete_post.setVisible(False)
         self._load_categories()
         self.stack.setCurrentIndex(1)
+        self._autosave_timer.start(self._autosave_interval)
 
     def _edit_selected_post(self):
         """Abre el editor con el post seleccionado."""
@@ -768,6 +777,7 @@ class PostsWidget(QWidget):
         self.btn_delete_post.setVisible(True)
         self._load_categories(post.get("categories", []))
         self.stack.setCurrentIndex(1)
+        self._autosave_timer.start(self._autosave_interval)
 
     def _load_categories(self, selected_ids=None):
         """Carga las categorías disponibles en hilo secundario."""
@@ -987,6 +997,8 @@ class PostsWidget(QWidget):
 
     def _back_to_list(self):
         """Vuelve a la vista de lista."""
+        self._autosave_timer.stop()
+        clear_autosave("post")
         self.stack.setCurrentIndex(0)
         self.load_posts()
 
@@ -1145,30 +1157,135 @@ class PostsWidget(QWidget):
         return data
 
     def _save_offline_draft(self):
-        """Guarda el contenido actual como borrador offline."""
+        """Guarda el contenido actual como borrador offline (todos los campos)."""
         if not self.offline_manager:
             return
 
-        title = self.txt_title.text().strip()
-        if not title:
-            title = "Sin título"
-
-        data = {
-            "title": title,
-            "content": self.editor.get_content(),
-            "status": "draft",
-            "excerpt": self.txt_excerpt.toPlainText(),
-            "slug": self.txt_slug.text().strip(),
-        }
-
+        data = self._gather_editor_data()
         post_id = self.current_post.get("id") if self.current_post else None
         draft_id = self.offline_manager.save_draft("post", data, post_id)
+        title = data.get("title", "Sin título")
         self.status_label.setText(f"Borrador offline guardado: {draft_id}")
         QMessageBox.information(
             self, "Borrador Offline",
             f"La entrada «{title}» se ha guardado localmente.\n"
             "Se sincronizará automáticamente cuando se restablezca la conexión."
         )
+
+    def _gather_editor_data(self):
+        """Recopila TODOS los campos del editor en un dict serializable."""
+        title = self.txt_title.text().strip() or "Sin título"
+
+        # Estado
+        status_map = {0: "draft", 1: "pending", 2: "publish", 3: "private"}
+        status = status_map.get(self.combo_status.currentIndex(), "draft")
+
+        # Formato
+        format_map = {
+            0: "standard", 1: "quote", 2: "status", 3: "chat",
+            4: "gallery", 5: "link", 6: "image", 7: "video", 8: "audio"
+        }
+        post_format = format_map.get(self.combo_format.currentIndex(), "standard")
+
+        # Categorías seleccionadas
+        selected_cats = []
+        def _collect_checked(parent_item):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    cid = child.data(0, Qt.ItemDataRole.UserRole)
+                    if cid is not None:
+                        selected_cats.append(cid)
+                _collect_checked(child)
+        root = self.cat_tree.invisibleRootItem()
+        _collect_checked(root)
+
+        # Etiquetas (texto tal como está)
+        tags_text = self.txt_tags.text().strip()
+
+        # Fecha
+        dt = self.date_edit.dateTime()
+        date_str = dt.toString(Qt.DateFormat.ISODate)
+
+        # SEO
+        seo_data = self._get_seo_data()
+
+        data = {
+            "title": title,
+            "content": self.editor.get_content(),
+            "status": status,
+            "excerpt": self.txt_excerpt.toPlainText(),
+            "slug": self.txt_slug.text().strip(),
+            "format_type": post_format,
+            "sticky": self.chk_sticky.isChecked(),
+            "password": self.txt_password.text(),
+            "comment_status": "open" if self.chk_comments.isChecked() else "closed",
+            "ping_status": "open" if self.chk_pings.isChecked() else "closed",
+            "featured_media": self.featured_media_id,
+            "categories": selected_cats,
+            "tags_text": tags_text,
+            "date": date_str,
+        }
+        if seo_data:
+            data["seo"] = seo_data
+        return data
+
+    def _do_autosave(self):
+        """Callback del timer: guarda el estado del editor localmente."""
+        # Solo autoguardar si estamos en la vista de edición
+        if self.stack.currentIndex() != 1:
+            return
+        title = self.txt_title.text().strip()
+        content = self.editor.get_content()
+        # No autoguardar si no hay título ni contenido
+        if not title and not content:
+            return
+        try:
+            data = self._gather_editor_data()
+            post_id = self.current_post.get("id") if self.current_post else None
+            save_autosave("post", data, post_id)
+        except Exception:
+            pass  # no interrumpir al usuario si falla el autosave
+
+    def check_and_recover_autosave(self):
+        """Comprueba si hay un autoguardado pendiente y ofrece recuperarlo.
+
+        Debe llamarse después de que el widget esté listo (tras conectar).
+        Returns:
+            bool: True si se recuperó un borrador.
+        """
+        autosave = get_autosave("post")
+        if not autosave:
+            return False
+
+        data = autosave.get("data", {})
+        title = data.get("title", "Sin título")
+        saved_at = autosave.get("saved_at", "")[:19].replace("T", " ")
+        post_id = autosave.get("post_id")
+        action = "edición" if post_id else "nueva entrada"
+
+        reply = QMessageBox.question(
+            self, "Recuperar borrador",
+            f"Se encontró un borrador autoguardado:\n\n"
+            f"  Título: {title}\n"
+            f"  Tipo: {action}\n"
+            f"  Guardado: {saved_at}\n\n"
+            "¿Deseas recuperarlo para seguir editándolo?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            # Construir un dict compatible con load_from_draft
+            draft_compat = {
+                "type": "post",
+                "post_id": post_id,
+                "data": data,
+            }
+            self.load_from_draft(draft_compat)
+            clear_autosave("post")
+            return True
+        else:
+            clear_autosave("post")
+            return False
 
     def showEvent(self, a0):
         """Se ejecuta al mostrar el widget."""
@@ -1189,11 +1306,11 @@ class PostsWidget(QWidget):
         # Si es una edición de un post existente, guardamos la referencia mínima
         if post_id:
             self.current_post = {"id": post_id}
-            self.edit_title_label.setText("Editar Entrada (borrador offline)")
+            self.edit_title_label.setText("Editar Entrada (borrador recuperado)")
             self.btn_delete_post.setVisible(True)
         else:
             self.current_post = None
-            self.edit_title_label.setText("Nueva Entrada (borrador offline)")
+            self.edit_title_label.setText("Nueva Entrada (borrador recuperado)")
             self.btn_delete_post.setVisible(False)
 
         self.txt_title.setText(data.get("title", ""))
@@ -1219,7 +1336,20 @@ class PostsWidget(QWidget):
             format_map.get(data.get("format_type", "standard"), 0)
         )
 
-        self.date_edit.setDateTime(QDateTime.currentDateTime())
+        # Fecha: usar la guardada si existe, si no la actual
+        date_str = data.get("date", "")
+        if date_str:
+            try:
+                from dateutil import parser as dateutil_parser
+                dt = dateutil_parser.parse(date_str)
+                self.date_edit.setDateTime(QDateTime(
+                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+                ))
+            except Exception:
+                self.date_edit.setDateTime(QDateTime.currentDateTime())
+        else:
+            self.date_edit.setDateTime(QDateTime.currentDateTime())
+
         self.chk_sticky.setChecked(data.get("sticky", False))
         self.txt_password.setText(data.get("password", ""))
         self.chk_comments.setChecked(
@@ -1228,13 +1358,41 @@ class PostsWidget(QWidget):
         self.chk_pings.setChecked(
             data.get("ping_status", "open") == "open"
         )
+
+        # Imagen destacada
         self.featured_media_id = data.get("featured_media", 0)
-        self.lbl_featured.setText("Sin imagen destacada")
-        self.txt_tags.clear()
+        if self.featured_media_id:
+            self.lbl_featured.setText("Cargando miniatura...")
+            self._load_featured_thumbnail(self.featured_media_id)
+        else:
+            self.lbl_featured.setText("Sin imagen destacada")
+            self.lbl_featured.setPixmap(QPixmap())
+
+        # Etiquetas: restaurar texto guardado
+        tags_text = data.get("tags_text", "")
+        self.txt_tags.setText(tags_text)
+
+        # SEO: restaurar si hay datos guardados
+        seo_data = data.get("seo", {})
+        if seo_data:
+            self.txt_seo_title.setText(seo_data.get("seo_title", ""))
+            self.txt_seo_description.setPlainText(seo_data.get("meta_description", ""))
+            self.txt_seo_keyword.setText(seo_data.get("focus_keyword", ""))
+            self.txt_seo_canonical.setText(seo_data.get("canonical_url", ""))
+            self.txt_seo_og_title.setText(seo_data.get("og_title", ""))
+            self.txt_seo_og_desc.setText(seo_data.get("og_description", ""))
+            self.txt_seo_og_image.setText(seo_data.get("og_image", ""))
+            self.chk_seo_noindex.setChecked(bool(seo_data.get("meta_robots_noindex", False)))
+            self.chk_seo_nofollow.setChecked(bool(seo_data.get("meta_robots_nofollow", False)))
+        else:
+            self._clear_seo_fields()
 
         self._load_categories(data.get("categories", []))
         self.stack.setCurrentIndex(1)
 
+        # Iniciar autoguardado para el borrador recuperado
+        self._autosave_timer.start(self._autosave_interval)
+
         # Guardar referencia al borrador offline para poder eliminarlo tras publicar
         self._loaded_offline_draft_id = draft.get("id")
-        self.status_label.setText("Borrador offline cargado en el editor")
+        self.status_label.setText("Borrador recuperado y cargado en el editor")

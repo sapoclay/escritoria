@@ -31,7 +31,8 @@ from utils.screen_utils import (
     get_dialog_size
 )
 from utils.offline_manager import (
-    OfflineManager, OfflineStatusWidget, OfflineDraftsDialog, SyncThread
+    OfflineManager, OfflineStatusWidget, OfflineDraftsDialog, SyncThread,
+    has_any_autosave
 )
 
 
@@ -462,6 +463,9 @@ class MainWindow(QMainWindow):
 
             # Cargar conteos del dashboard
             self._load_dashboard_counts()
+
+            # Comprobar borradores autoguardados y offline pendientes
+            self._check_pending_drafts()
         else:
             error = result.get("error", "Error desconocido")
             self.lbl_connection_status.setText("Error de conexión")
@@ -598,6 +602,32 @@ class MainWindow(QMainWindow):
                 )
         else:
             self._status_message("Sin conexión — Modo offline activo")
+
+    def _check_pending_drafts(self):
+        """Comprueba autoguardados y borradores offline pendientes tras conectar.
+
+        Se ejecuta una sola vez después de que los widgets estén creados.
+        Primero revisa autoguardados locales (sesión interrumpida) y luego
+        borradores offline pendientes de sincronización.
+        """
+        # 1. Autoguardados locales (prioridad: el usuario estaba editando)
+        recovered = False
+        if self.posts_widget:
+            recovered = self.posts_widget.check_and_recover_autosave()
+        if not recovered and self.pages_widget:
+            self.pages_widget.check_and_recover_autosave()
+
+        # 2. Borradores offline pendientes de sincronización
+        pending = self.offline_manager.pending_count
+        if pending > 0:
+            reply = QMessageBox.question(
+                self, "Borradores Offline Pendientes",
+                f"Hay {pending} borrador(es) offline pendiente(s) de sincronización.\n\n"
+                "¿Deseas ver la lista de borradores para recuperarlos o sincronizarlos?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self._show_offline_drafts()
 
     def _show_offline_drafts(self):
         """Muestra el diálogo de borradores offline."""
@@ -871,6 +901,9 @@ class MainWindow(QMainWindow):
         }
         save_config(config)
 
+        # Forzar autoguardado final si hay contenido en edición
+        self._force_autosave_all()
+
         # Si existe bandeja y no se pidio salir, minimizar
         if (
             hasattr(self, "tray_icon")
@@ -893,6 +926,19 @@ class MainWindow(QMainWindow):
             self.tray_icon.hide()
         if a0:
             a0.accept()
+
+    def _force_autosave_all(self):
+        """Fuerza un autoguardado inmediato de cualquier editor abierto."""
+        try:
+            if self.posts_widget and self.posts_widget.stack.currentIndex() == 1:
+                self.posts_widget._do_autosave()
+        except Exception:
+            pass
+        try:
+            if self.pages_widget and self.pages_widget.stack.currentIndex() == 1:
+                self.pages_widget._do_autosave()
+        except Exception:
+            pass
 
 
 # Necesario importar QGroupBox

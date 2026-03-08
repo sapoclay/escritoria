@@ -21,11 +21,74 @@ from config.settings import CONFIG_DIR
 
 OFFLINE_DIR = CONFIG_DIR / "offline_drafts"
 OFFLINE_INDEX_FILE = OFFLINE_DIR / "index.json"
+AUTOSAVE_DIR = CONFIG_DIR / "autosave"
 
 
 def ensure_offline_dir():
     """Crea el directorio de borradores offline si no existe."""
     OFFLINE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_autosave_dir():
+    """Crea el directorio de autoguardado si no existe."""
+    AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_autosave(content_type: str, data: dict, post_id=None):
+    """Guarda el estado actual del editor como autoguardado local.
+
+    Args:
+        content_type: 'post' o 'page'
+        data: dict con todos los campos del editor
+        post_id: ID del post/página si es edición (None para nuevo)
+    """
+    ensure_autosave_dir()
+    autosave_file = AUTOSAVE_DIR / f"{content_type}_autosave.json"
+    autosave_data = {
+        "type": content_type,
+        "post_id": post_id,
+        "data": data,
+        "saved_at": datetime.now().isoformat(),
+    }
+    with open(autosave_file, "w", encoding="utf-8") as f:
+        json.dump(autosave_data, f, indent=2, ensure_ascii=False)
+
+
+def get_autosave(content_type: str):
+    """Obtiene el autoguardado local para un tipo de contenido.
+
+    Returns:
+        dict o None si no hay autoguardado.
+    """
+    autosave_file = AUTOSAVE_DIR / f"{content_type}_autosave.json"
+    if autosave_file.exists():
+        try:
+            with open(autosave_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
+def clear_autosave(content_type: str):
+    """Elimina el autoguardado local para un tipo de contenido."""
+    autosave_file = AUTOSAVE_DIR / f"{content_type}_autosave.json"
+    if autosave_file.exists():
+        autosave_file.unlink()
+
+
+def has_any_autosave():
+    """Comprueba si existe algún autoguardado pendiente.
+
+    Returns:
+        list[dict]: lista de autoguardados encontrados (vacía si no hay).
+    """
+    results = []
+    for ctype in ("post", "page"):
+        data = get_autosave(ctype)
+        if data:
+            results.append(data)
+    return results
 
 
 class OfflineManager(QObject):
@@ -510,7 +573,7 @@ class OfflineDraftsDialog(QDialog):
             QMessageBox.warning(self, "Error",
                                 "No se pudo leer el archivo del borrador.")
             return
-        self.load_requested.emit(draft)
+        self.load_requested.emit(draft)  # type: ignore[attr-defined]
         self.close()
 
     def _sync_all(self):

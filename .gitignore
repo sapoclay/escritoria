@@ -26,6 +26,11 @@ build/
 *.egg
 *.spec
 
+# ===== Empaquetado .deb =====
+debian/
+build_deb.sh
+*.deb
+
 # ===== IDE / Editores =====
 .vscode/
 .idea/
