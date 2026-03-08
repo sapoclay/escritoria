@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
     QMessageBox, QGroupBox
 )
+from PyQt5.QtGui import QColor
 
 from config.settings import CONFIG_DIR
 
@@ -463,7 +464,7 @@ class OfflineStatusWidget(QWidget):
 
 
 class OfflineDraftsDialog(QDialog):
-    """Diálogo para ver y gestionar borradores offline."""
+    """Diálogo para ver y gestionar borradores offline y autoguardados."""
 
     # Señal emitida cuando el usuario quiere cargar un borrador en el editor.
     # Emite el dict completo del borrador (tal como lo devuelve get_draft).
@@ -472,8 +473,8 @@ class OfflineDraftsDialog(QDialog):
     def __init__(self, offline_manager, parent=None):
         super().__init__(parent)
         self.offline_manager = offline_manager
-        self.setWindowTitle("Borradores Offline")
-        self.setMinimumSize(500, 400)
+        self.setWindowTitle("Borradores guardados")
+        self.setMinimumSize(550, 450)
         self._setup_ui()
         self._load_drafts()
 
@@ -482,8 +483,8 @@ class OfflineDraftsDialog(QDialog):
 
         # Info
         info = QLabel(
-            "Borradores guardados localmente mientras estabas sin conexión.\n"
-            "Cuando la conexión se restablezca, puedes sincronizarlos con el servidor."
+            "Borradores guardados localmente (autoguardados y offline).\n"
+            "Puedes recuperarlos para seguir editando o sincronizarlos con el servidor."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #a7aaad; padding: 5px;")
@@ -531,32 +532,56 @@ class OfflineDraftsDialog(QDialog):
         layout.addWidget(self.lbl_status)
 
     def _load_drafts(self):
-        """Carga la lista de borradores."""
+        """Carga la lista de borradores (offline + autoguardados)."""
         self.draft_list.clear()
-        drafts = self.offline_manager.get_all_drafts()
+        has_items = False
 
-        if not drafts:
-            item = QListWidgetItem("No hay borradores offline pendientes.")
-            item.setFlags(Qt.ItemFlag(item.flags() & ~Qt.ItemFlag.ItemIsSelectable))
+        # --- Autoguardados ---
+        autosaves = has_any_autosave()
+        for autosave in autosaves:
+            title = autosave.get("data", {}).get("title", "Sin título")
+            ctype = autosave.get("type", "post")
+            dtype = "Entrada" if ctype == "post" else "Página"
+            action = "Edición" if autosave.get("post_id") else "Nueva"
+            saved_at = autosave.get("saved_at", "")[:19].replace("T", " ")
+
+            text = f"💾 [Autoguardado • {dtype}] {action}: {title}  —  {saved_at}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, f"__autosave__{ctype}")
+            item.setForeground(QColor("#f0c674"))  # amarillo para distinguir
             self.draft_list.addItem(item)
-            self.btn_load.setEnabled(False)
-            self.btn_sync_all.setEnabled(False)
-            self.btn_delete_selected.setEnabled(False)
-            self.btn_clear_all.setEnabled(False)
-            return
+            has_items = True
 
+        # --- Borradores offline ---
+        drafts = self.offline_manager.get_all_drafts()
         for draft in drafts:
             title = draft.get("data", {}).get("title", "Sin título")
             dtype = "Entrada" if draft["type"] == "post" else "Página"
             action = "Editar" if draft.get("post_id") else "Crear"
             created = draft.get("created_at", "")[:19].replace("T", " ")
 
-            text = f"[{dtype}] {action}: {title}  —  {created}"
+            text = f"☁ [Offline • {dtype}] {action}: {title}  —  {created}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, draft["id"])
             self.draft_list.addItem(item)
+            has_items = True
 
-        self.lbl_status.setText(f"{len(drafts)} borrador(es) pendiente(s)")
+        if not has_items:
+            item = QListWidgetItem("No hay borradores guardados.")
+            item.setFlags(Qt.ItemFlag(item.flags() & ~Qt.ItemFlag.ItemIsSelectable))
+            self.draft_list.addItem(item)
+            self.btn_load.setEnabled(False)
+            self.btn_sync_all.setEnabled(False)
+            self.btn_delete_selected.setEnabled(False)
+            self.btn_clear_all.setEnabled(False)
+        else:
+            self.btn_load.setEnabled(True)
+            self.btn_delete_selected.setEnabled(True)
+            self.btn_clear_all.setEnabled(len(drafts) > 0)
+            self.btn_sync_all.setEnabled(len(drafts) > 0)
+
+        total = len(autosaves) + len(drafts)
+        self.lbl_status.setText(f"{total} borrador(es) encontrado(s)")
 
     def _load_selected(self):
         """Carga el borrador seleccionado en el editor."""
@@ -568,6 +593,27 @@ class OfflineDraftsDialog(QDialog):
         draft_id = item.data(Qt.ItemDataRole.UserRole)
         if not draft_id:
             return
+
+        # ¿Es un autoguardado?
+        if isinstance(draft_id, str) and draft_id.startswith("__autosave__"):
+            ctype = draft_id.replace("__autosave__", "")
+            autosave = get_autosave(ctype)
+            if not autosave:
+                QMessageBox.warning(self, "Error",
+                                    "No se pudo leer el autoguardado.")
+                return
+            # Construir dict compatible con load_from_draft
+            draft_compat = {
+                "type": ctype,
+                "post_id": autosave.get("post_id"),
+                "data": autosave.get("data", {}),
+            }
+            self.load_requested.emit(draft_compat)  # type: ignore[attr-defined]
+            clear_autosave(ctype)
+            self.close()
+            return
+
+        # Borrador offline normal
         draft = self.offline_manager.get_draft(draft_id)
         if not draft:
             QMessageBox.warning(self, "Error",
@@ -600,21 +646,28 @@ class OfflineDraftsDialog(QDialog):
 
         reply = QMessageBox.question(
             self, "Confirmar",
-            "¿Eliminar este borrador offline?",
+            "¿Eliminar este borrador?",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            self.offline_manager.delete_draft(draft_id)
+            # ¿Es un autoguardado?
+            if isinstance(draft_id, str) and draft_id.startswith("__autosave__"):
+                ctype = draft_id.replace("__autosave__", "")
+                clear_autosave(ctype)
+            else:
+                self.offline_manager.delete_draft(draft_id)
             self._load_drafts()
 
     def _clear_all(self):
         """Elimina todos los borradores."""
         reply = QMessageBox.question(
             self, "Confirmar",
-            "¿Eliminar TODOS los borradores offline?\n"
+            "¿Eliminar TODOS los borradores (offline y autoguardados)?\n"
             "Esta acción no se puede deshacer.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             self.offline_manager.clear_all()
+            clear_autosave("post")
+            clear_autosave("page")
             self._load_drafts()
